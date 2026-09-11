@@ -1,0 +1,502 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>BioSynth SD Manager</title>
+  <style>
+    :root {
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color-scheme: dark;
+    }
+    body {
+      margin: 0;
+      background: #111;
+      color: #eee;
+    }
+    main {
+      max-width: 860px;
+      margin: 0 auto;
+      padding: 48px 24px 64px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 2rem;
+      font-weight: 650;
+    }
+    .subtitle {
+      color: #aaa;
+      margin-bottom: 28px;
+    }
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 24px;
+    }
+    button {
+      border: 1px solid #555;
+      background: #1d1d1d;
+      color: #f5f5f5;
+      border-radius: 8px;
+      padding: 10px 14px;
+      cursor: pointer;
+      font: inherit;
+    }
+    button:hover:not(:disabled) {
+      background: #292929;
+    }
+    button:disabled {
+      opacity: 0.45;
+      cursor: default;
+    }
+    .status {
+      padding: 12px 14px;
+      border: 1px solid #333;
+      border-radius: 8px;
+      background: #181818;
+      margin-bottom: 24px;
+      white-space: pre-wrap;
+    }
+    .status.ok { border-color: #3f6d4a; }
+    .status.error { border-color: #7a3c3c; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      border: 1px solid #333;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    th, td {
+      padding: 12px 14px;
+      border-bottom: 1px solid #2f2f2f;
+      text-align: left;
+      vertical-align: middle;
+    }
+    th {
+      color: #aaa;
+      font-weight: 600;
+      background: #181818;
+    }
+    td.size {
+      width: 130px;
+      color: #bbb;
+      white-space: nowrap;
+    }
+    td.action {
+      width: 120px;
+      text-align: right;
+    }
+    .empty {
+      color: #999;
+      padding: 24px 0;
+    }
+    .progress-wrap {
+      margin-top: 10px;
+      height: 8px;
+      background: #2a2a2a;
+      border-radius: 999px;
+      overflow: hidden;
+      display: none;
+    }
+    .progress-bar {
+      height: 100%;
+      width: 0%;
+      background: #888;
+    }
+    code {
+      color: #ddd;
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>BioSynth SD Manager</h1>
+  <div class="subtitle">Connect to a Teensy 4.1 over USB serial, list recordings, and download files.</div>
+
+  <div class="toolbar">
+    <button id="connectButton">Connect BioSynth</button>
+    <button id="refreshButton" disabled>Refresh files</button>
+    <button id="disconnectButton" disabled>Disconnect</button>
+  </div>
+
+  <div id="status" class="status">Not connected.</div>
+
+  <div id="progressWrap" class="progress-wrap">
+    <div id="progressBar" class="progress-bar"></div>
+  </div>
+
+  <section>
+    <h2>SD card</h2>
+    <div id="emptyMessage" class="empty">Connect BioSynth to view recordings.</div>
+    <table id="fileTable" hidden>
+      <thead>
+        <tr>
+          <th>Filename</th>
+          <th>Size</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="fileBody"></tbody>
+    </table>
+  </section>
+</main>
+
+<script>
+const PREFIX = "BIOSYNTH_SD_";
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+
+let port = null;
+let reader = null;
+let writer = null;
+let readBuffer = new Uint8Array(0);
+let busy = false;
+
+const connectButton = document.getElementById("connectButton");
+const refreshButton = document.getElementById("refreshButton");
+const disconnectButton = document.getElementById("disconnectButton");
+const statusEl = document.getElementById("status");
+const fileTable = document.getElementById("fileTable");
+const fileBody = document.getElementById("fileBody");
+const emptyMessage = document.getElementById("emptyMessage");
+const progressWrap = document.getElementById("progressWrap");
+const progressBar = document.getElementById("progressBar");
+
+function setStatus(message, kind = "") {
+  statusEl.textContent = message;
+  statusEl.className = "status" + (kind ? " " + kind : "");
+}
+
+function setBusy(value) {
+  busy = value;
+  connectButton.disabled = value || !!port;
+  refreshButton.disabled = value || !port;
+  disconnectButton.disabled = value || !port;
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function concatBytes(a, b) {
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a, 0);
+  out.set(b, a.length);
+  return out;
+}
+
+async function fillBuffer(minBytes = 1) {
+  while (readBuffer.length < minBytes) {
+    const { value, done } = await reader.read();
+    if (done) throw new Error("Serial connection closed.");
+    if (value && value.length) {
+      readBuffer = concatBytes(readBuffer, value);
+    }
+  }
+}
+
+async function readLine(timeoutMs = 10000) {
+  const start = Date.now();
+  while (true) {
+    for (let i = 0; i < readBuffer.length; i++) {
+      if (readBuffer[i] === 10) {
+        let lineBytes = readBuffer.slice(0, i);
+        readBuffer = readBuffer.slice(i + 1);
+        if (lineBytes.length && lineBytes[lineBytes.length - 1] === 13) {
+          lineBytes = lineBytes.slice(0, -1);
+        }
+        return decoder.decode(lineBytes);
+      }
+    }
+
+    if (Date.now() - start > timeoutMs) {
+      throw new Error("Timed out waiting for a response from BioSynth.");
+    }
+
+    const readPromise = reader.read();
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("Timed out waiting for a response from BioSynth.")), 250)
+    );
+
+    try {
+      const result = await Promise.race([readPromise, timeoutPromise]);
+      if (result.done) throw new Error("Serial connection closed.");
+      if (result.value && result.value.length) {
+        readBuffer = concatBytes(readBuffer, result.value);
+      }
+    } catch (err) {
+      if (!String(err.message).includes("Timed out waiting")) throw err;
+    }
+  }
+}
+
+async function readProtocolLine(timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const line = await readLine(Math.max(250, deadline - Date.now()));
+    if (line.startsWith(PREFIX)) return line;
+  }
+  throw new Error("Timed out waiting for a BioSynth protocol response.");
+}
+
+async function readExact(size, onProgress) {
+  const chunks = [];
+  let received = 0;
+
+  if (readBuffer.length) {
+    const take = Math.min(size, readBuffer.length);
+    chunks.push(readBuffer.slice(0, take));
+    readBuffer = readBuffer.slice(take);
+    received += take;
+    onProgress?.(received, size);
+  }
+
+  while (received < size) {
+    const { value, done } = await reader.read();
+    if (done) throw new Error("Serial connection closed during file transfer.");
+    if (!value || !value.length) continue;
+
+    const need = size - received;
+    if (value.length <= need) {
+      chunks.push(value);
+      received += value.length;
+    } else {
+      chunks.push(value.slice(0, need));
+      readBuffer = concatBytes(value.slice(need), readBuffer);
+      received += need;
+    }
+    onProgress?.(received, size);
+  }
+
+  const result = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return result;
+}
+
+async function sendLine(text) {
+  await writer.write(encoder.encode(text + "\n"));
+}
+
+async function listFiles() {
+  setBusy(true);
+  setStatus("Reading SD card…");
+  try {
+    await sendLine("BIOSYNTH_SD_LIST");
+
+    let line = await readProtocolLine();
+    if (line.startsWith("BIOSYNTH_SD_ERROR\t")) {
+      throw new Error(line);
+    }
+    if (line !== "BIOSYNTH_SD_LIST_BEGIN") {
+      throw new Error(`Unexpected response: ${line}`);
+    }
+
+    const files = [];
+    while (true) {
+      line = await readProtocolLine();
+      if (line === "BIOSYNTH_SD_LIST_END") break;
+      if (line.startsWith("BIOSYNTH_SD_ERROR\t")) {
+        throw new Error(line);
+      }
+      if (!line.startsWith("BIOSYNTH_SD_ENTRY\t")) continue;
+
+      const parts = line.split("\t");
+      if (parts.length < 3) continue;
+      const size = Number(parts[1]);
+      const filename = parts.slice(2).join("\t");
+      files.push({ filename, size });
+    }
+
+    renderFiles(files);
+    setStatus(`Connected. Found ${files.length} file${files.length === 1 ? "" : "s"} on the SD card.`, "ok");
+  } finally {
+    setBusy(false);
+  }
+}
+
+function renderFiles(files) {
+  fileBody.innerHTML = "";
+
+  if (!files.length) {
+    fileTable.hidden = true;
+    emptyMessage.hidden = false;
+    emptyMessage.textContent = "No files found on the SD card.";
+    return;
+  }
+
+  emptyMessage.hidden = true;
+  fileTable.hidden = false;
+
+  for (const file of files) {
+    const tr = document.createElement("tr");
+
+    const nameTd = document.createElement("td");
+    nameTd.textContent = file.filename;
+
+    const sizeTd = document.createElement("td");
+    sizeTd.textContent = formatBytes(file.size);
+    sizeTd.className = "size";
+
+    const actionTd = document.createElement("td");
+    actionTd.className = "action";
+
+    const button = document.createElement("button");
+    button.textContent = "Download";
+    button.addEventListener("click", () => downloadFile(file.filename, file.size));
+
+    actionTd.appendChild(button);
+    tr.append(nameTd, sizeTd, actionTd);
+    fileBody.appendChild(tr);
+  }
+}
+
+async function downloadFile(filename, expectedSize) {
+  setBusy(true);
+  progressWrap.style.display = "block";
+  progressBar.style.width = "0%";
+  setStatus(`Downloading ${filename}…`);
+
+  try {
+    await sendLine(`BIOSYNTH_SD_GET\t${filename}`);
+
+    let line = await readProtocolLine();
+    if (line.startsWith("BIOSYNTH_SD_ERROR\t")) {
+      throw new Error(line);
+    }
+    if (!line.startsWith("BIOSYNTH_SD_FILE\t")) {
+      throw new Error(`Unexpected response: ${line}`);
+    }
+
+    const parts = line.split("\t");
+    if (parts.length < 3) throw new Error("Malformed BIOSYNTH_SD_FILE response.");
+
+    const returnedSize = Number(parts[1]);
+    const returnedName = parts.slice(2).join("\t");
+
+    if (returnedName !== filename || returnedSize !== expectedSize) {
+      throw new Error("File metadata changed. Refresh the file list and try again.");
+    }
+
+    const data = await readExact(returnedSize, (received, total) => {
+      progressBar.style.width = `${Math.round(received / total * 100)}%`;
+      setStatus(`Downloading ${filename}… ${formatBytes(received)} / ${formatBytes(total)}`);
+    });
+
+    line = await readProtocolLine();
+    if (line !== "BIOSYNTH_SD_FILE_END") {
+      throw new Error(`Transfer did not end correctly: ${line}`);
+    }
+
+    const blob = new Blob([data], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+    setStatus(`Downloaded ${filename} (${formatBytes(returnedSize)}).`, "ok");
+  } catch (err) {
+    console.error(err);
+    setStatus(`Error: ${err.message}`, "error");
+  } finally {
+    progressWrap.style.display = "none";
+    setBusy(false);
+  }
+}
+
+async function connect() {
+  if (!("serial" in navigator)) {
+    setStatus(
+      "This browser does not expose the Web Serial API. Try current Chrome/Chromium first.",
+      "error"
+    );
+    return;
+  }
+
+  setBusy(true);
+  try {
+    port = await navigator.serial.requestPort({
+      filters: [{ usbVendorId: 0x16C0 }]
+    });
+
+    await port.open({ baudRate: 115200 });
+
+    reader = port.readable.getReader();
+    writer = port.writable.getWriter();
+    readBuffer = new Uint8Array(0);
+
+    setStatus("Connected to BioSynth.", "ok");
+
+    // Give Teensy a brief moment after opening the serial connection.
+    await new Promise(resolve => setTimeout(resolve, 750));
+
+    await listFiles();
+  } catch (err) {
+    console.error(err);
+    if (port) {
+      try { await disconnect(); } catch (_) {}
+    }
+    setStatus(`Connection error: ${err.message}`, "error");
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function disconnect() {
+  setBusy(true);
+  try {
+    if (reader) {
+      try { await reader.cancel(); } catch (_) {}
+      try { reader.releaseLock(); } catch (_) {}
+      reader = null;
+    }
+    if (writer) {
+      try { writer.releaseLock(); } catch (_) {}
+      writer = null;
+    }
+    if (port) {
+      try { await port.close(); } catch (_) {}
+      port = null;
+    }
+    readBuffer = new Uint8Array(0);
+    fileBody.innerHTML = "";
+    fileTable.hidden = true;
+    emptyMessage.hidden = false;
+    emptyMessage.textContent = "Connect BioSynth to view recordings.";
+    setStatus("Disconnected.");
+  } finally {
+    setBusy(false);
+  }
+}
+
+connectButton.addEventListener("click", connect);
+refreshButton.addEventListener("click", async () => {
+  try {
+    await listFiles();
+  } catch (err) {
+    console.error(err);
+    setStatus(`Error: ${err.message}`, "error");
+  }
+});
+disconnectButton.addEventListener("click", disconnect);
+
+navigator.serial?.addEventListener("disconnect", async event => {
+  if (port && event.target === port) {
+    await disconnect();
+    setStatus("BioSynth was disconnected.", "error");
+  }
+});
+</script>
+</body>
+</html>
